@@ -7,7 +7,7 @@ def default_vehicle_dynamics_parameters() -> VehicleDynamicsParameters:
     """Return first-pass 6-DOF dynamic parameters for the vehicle.
 
     These values are placeholders for the initial software architecture. They
-    should be replaced by identified BlueROV2 parameters before interpreting
+    should be replaced by identified vehicle parameters before interpreting
     simulation results physically.
     """
 

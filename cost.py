@@ -2,8 +2,13 @@ from collections.abc import Callable
 
 import numpy as np
 
+from allocation import (
+    allocation_quality_penalty,
+    inward_direction_penalty,
+    position_spacing_penalty,
+)
 from config import ProblemConfig
-from models import SimulationResult
+from models import Design, SimulationResult, VehicleModel
 
 ObjectiveCostFunction = Callable[[SimulationResult, ProblemConfig], float]
 TARGET_POSE_OBJECTIVE_MODES = ("target_position", "target_pose")
@@ -174,6 +179,91 @@ def target_arrival_time_cost(simulation: SimulationResult, cfg: ProblemConfig) -
     return float(simulation.time[-1] + distances[-1])
 
 
+def station_keeping_sample_indices(
+    simulation: SimulationResult,
+    cfg: ProblemConfig,
+) -> np.ndarray:
+    """Return sample indices used to evaluate station-keeping behavior."""
+
+    if cfg.objective.mode not in TARGET_POSE_OBJECTIVE_MODES:
+        return np.array([], dtype=int)
+    if not cfg.objective.require_station_keeping:
+        return np.array([], dtype=int)
+
+    window = float(cfg.objective.station_keeping_window)
+    if window <= 0.0:
+        raise ValueError("station_keeping_window must be positive")
+
+    time = np.asarray(simulation.time, dtype=float)
+
+    if cfg.objective.target_time is not None:
+        target_index = target_sample_index(simulation, cfg)
+        target_time = float(time[target_index])
+        after_end = min(float(time[-1]), target_time + window)
+        after_indices = np.flatnonzero((time >= target_time) & (time <= after_end))
+
+        if after_indices.size > 1:
+            return after_indices
+
+        before_start = max(float(time[0]), target_time - window)
+        return np.flatnonzero((time >= before_start) & (time <= target_time))
+
+    target_position = np.asarray(cfg.objective.target_position, dtype=float)
+    if target_position.shape != (3,):
+        raise ValueError("target_position must have shape (3,)")
+
+    distances = np.linalg.norm(simulation.eta[:, :3] - target_position, axis=1)
+    reached_indices = np.flatnonzero(distances <= cfg.objective.target_tolerance)
+
+    if reached_indices.size > 0:
+        start_time = float(time[reached_indices[0]])
+        end_time = min(float(time[-1]), start_time + window)
+        return np.flatnonzero((time >= start_time) & (time <= end_time))
+
+    start_time = max(float(time[0]), float(time[-1]) - window)
+    return np.flatnonzero(time >= start_time)
+
+
+def station_keeping_cost_components(
+    simulation: SimulationResult,
+    cfg: ProblemConfig,
+) -> dict[str, float]:
+    """Return station-keeping penalties near or after target arrival."""
+
+    zero_components = {
+        "station_position": 0.0,
+        "station_attitude": 0.0,
+        "station_linear_velocity": 0.0,
+        "station_angular_velocity": 0.0,
+    }
+    sample_indices = station_keeping_sample_indices(simulation, cfg)
+    if sample_indices.size == 0:
+        return zero_components
+
+    target_position = np.asarray(cfg.objective.target_position, dtype=float)
+    target_attitude = np.asarray(cfg.objective.target_attitude, dtype=float)
+    if target_position.shape != (3,):
+        raise ValueError("target_position must have shape (3,)")
+    if target_attitude.shape != (3,):
+        raise ValueError("target_attitude must have shape (3,)")
+
+    position_error = simulation.eta[sample_indices, :3] - target_position
+    attitude_error = wrap_angle_error(
+        simulation.eta[sample_indices, 3:6] - target_attitude
+    )
+    linear_velocity = simulation.nu[sample_indices, :3]
+    angular_velocity = simulation.nu[sample_indices, 3:6]
+
+    return {
+        "station_position": float(np.mean(np.sum(position_error**2, axis=1))),
+        "station_attitude": float(np.mean(np.sum(attitude_error**2, axis=1))),
+        "station_linear_velocity": float(np.mean(np.sum(linear_velocity**2, axis=1))),
+        "station_angular_velocity": float(
+            np.mean(np.sum(angular_velocity**2, axis=1))
+        ),
+    }
+
+
 def objective_cost(simulation: SimulationResult, cfg: ProblemConfig) -> float:
     """Return the active mission objective selected in cfg.objective.mode."""
 
@@ -218,9 +308,44 @@ def smoothness_cost(simulation: SimulationResult) -> float:
     return float(np.sum(command_differences**2))
 
 
+def design_cost_components(
+    design: Design | None,
+    vehicle: VehicleModel | None,
+    cfg: ProblemConfig,
+) -> dict[str, float]:
+    """Return unweighted penalties attached to the optimized thruster layout."""
+
+    if design is None or vehicle is None:
+        return {
+            "allocation_quality": 0.0,
+            "inward_direction": 0.0,
+            "position_spacing": 0.0,
+        }
+
+    return {
+        "allocation_quality": allocation_quality_penalty(
+            design=design,
+            vehicle=vehicle,
+            min_singular_value=cfg.design.min_allocation_singular_value,
+        ),
+        "inward_direction": inward_direction_penalty(
+            design=design,
+            vehicle=vehicle,
+            min_outward_dot=cfg.design.min_direction_outward_dot,
+        ),
+        "position_spacing": position_spacing_penalty(
+            design=design,
+            vehicle=vehicle,
+            min_spacing=cfg.design.min_thruster_spacing,
+        ),
+    }
+
+
 def cost_components(
     simulation: SimulationResult,
     cfg: ProblemConfig,
+    design: Design | None = None,
+    vehicle: VehicleModel | None = None,
 ) -> dict[str, float]:
     """Return unweighted cost components for diagnostics."""
 
@@ -228,6 +353,8 @@ def cost_components(
         mode: objective_function(simulation, cfg)
         for mode, objective_function in OBJECTIVE_COSTS.items()
     }
+    layout_components = design_cost_components(design, vehicle, cfg)
+    station_components = station_keeping_cost_components(simulation, cfg)
 
     return {
         "objective": objective_cost(simulation, cfg),
@@ -239,13 +366,20 @@ def cost_components(
         "attitude": attitude_cost(simulation),
         "energy": energy_cost(simulation, cfg),
         "smoothness": smoothness_cost(simulation),
+        **station_components,
+        **layout_components,
     }
 
 
-def trajectory_cost(simulation: SimulationResult, cfg: ProblemConfig) -> float:
+def trajectory_cost(
+    simulation: SimulationResult,
+    cfg: ProblemConfig,
+    design: Design | None = None,
+    vehicle: VehicleModel | None = None,
+) -> float:
     """Return the weighted scalar objective J for one simulated trajectory."""
 
-    components = cost_components(simulation, cfg)
+    components = cost_components(simulation, cfg, design, vehicle)
     weights = cfg.cost
     drift_weight = weights.drift
     attitude_weight = weights.attitude
@@ -261,4 +395,11 @@ def trajectory_cost(simulation: SimulationResult, cfg: ProblemConfig) -> float:
         + attitude_weight * components["attitude"]
         + weights.energy * components["energy"]
         + weights.smoothness * components["smoothness"]
+        + weights.station_position * components["station_position"]
+        + weights.station_attitude * components["station_attitude"]
+        + weights.station_linear_velocity * components["station_linear_velocity"]
+        + weights.station_angular_velocity * components["station_angular_velocity"]
+        + weights.allocation_quality * components["allocation_quality"]
+        + weights.inward_direction * components["inward_direction"]
+        + weights.position_spacing * components["position_spacing"]
     )

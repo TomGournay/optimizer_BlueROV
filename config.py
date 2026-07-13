@@ -7,28 +7,83 @@ import numpy as np
 ObjectiveMode = str
 ControlMode = Literal["piecewise_constant", "pid_pose"]
 
+N_DESIGN_THRUSTERS = 6
+DESIGN_VECTOR_AXES = ("x", "y", "z")
+
+
+def vectorized_thruster_design_names(
+    n_thrusters: int = N_DESIGN_THRUSTERS,
+) -> tuple[str, ...]:
+    """Return raw position and direction vector component names."""
+
+    return tuple(
+        name
+        for motor_id in range(n_thrusters)
+        for name in (
+            *(f"pos_{axis}_m{motor_id}" for axis in DESIGN_VECTOR_AXES),
+            *(f"dir_{axis}_m{motor_id}" for axis in DESIGN_VECTOR_AXES),
+        )
+    )
+
+
+def default_thruster_position_vectors() -> np.ndarray:
+    """Return six default raw position vectors on the unit sphere."""
+
+    return np.array(
+        [
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
+        ],
+        dtype=float,
+    )
+
+
+def default_thruster_direction_vectors() -> np.ndarray:
+    """Return a deterministic full-rank default direction set."""
+
+    return np.array(
+        [
+            [0.053543, -0.483986, -0.873436],
+            [-0.190199, 0.769754, -0.609346],
+            [0.575425, 0.305400, 0.758695],
+            [-0.746158, -0.082759, 0.660605],
+            [-0.852098, -0.350176, 0.388981],
+            [-0.430419, 0.856988, -0.283392],
+        ],
+        dtype=float,
+    )
+
+
+def default_vectorized_thruster_design_values() -> np.ndarray:
+    """Return default raw design values grouped motor by motor."""
+
+    positions = default_thruster_position_vectors()
+    directions = default_thruster_direction_vectors()
+    values = np.concatenate((positions, directions), axis=1)
+    return values.reshape(-1)
+
 
 @dataclass(frozen=True)
 class DesignConfig:
     """Names and bounds for design variables."""
 
-    names: tuple[str, ...] = ("alpha",)
-    lower_bounds: np.ndarray = field(default_factory=lambda: np.array([np.deg2rad(0.0)]))
-    upper_bounds: np.ndarray = field(default_factory=lambda: np.array([np.deg2rad(90.0)]))
-
-    # Example with several design variables:
-    #
-    # names: tuple[str, ...] = ("alpha1", "alpha2")
-    # lower_bounds: np.ndarray = field(
-    #     default_factory=lambda: np.array([np.deg2rad(0.0), np.deg2rad(0.0)])
-    # )
-    # upper_bounds: np.ndarray = field(
-    #     default_factory=lambda: np.array([np.deg2rad(90.0), np.deg2rad(90.0)])
-    # )
-    #
-    # optimization.py will automatically use len(names) to size and decode z.
-    # The new variables must still be used explicitly in the physics, e.g.
-    # design.get("alpha1") and design.get("alpha2") inside allocation.py.
+    names: tuple[str, ...] = field(default_factory=vectorized_thruster_design_names)
+    default_values: np.ndarray = field(
+        default_factory=default_vectorized_thruster_design_values
+    )
+    lower_bounds: np.ndarray = field(
+        default_factory=lambda: -np.ones(6 * N_DESIGN_THRUSTERS)
+    )
+    upper_bounds: np.ndarray = field(
+        default_factory=lambda: np.ones(6 * N_DESIGN_THRUSTERS)
+    )
+    min_direction_outward_dot: float = -0.10
+    min_allocation_singular_value: float = 0.15
+    min_thruster_spacing: float = 0.08
 
     @property
     def n_parameters(self) -> int:
@@ -47,6 +102,21 @@ class DesignConfig:
             raise ValueError("design lower_bounds must be <= upper_bounds")
 
         return list(zip(lower_bounds.tolist(), upper_bounds.tolist()))
+
+    @property
+    def defaults(self) -> np.ndarray:
+        """Return validated default design values."""
+
+        default_values = np.asarray(self.default_values, dtype=float)
+        lower_bounds = np.asarray(self.lower_bounds, dtype=float)
+        upper_bounds = np.asarray(self.upper_bounds, dtype=float)
+
+        if default_values.shape != (self.n_parameters,):
+            raise ValueError("design default_values must match design names")
+        if np.any(default_values < lower_bounds) or np.any(default_values > upper_bounds):
+            raise ValueError("design default_values must be inside design bounds")
+
+        return default_values
 
 
 @dataclass(frozen=True)
@@ -77,7 +147,7 @@ class SimulationConfig:
     [north, east, down].
     """
 
-    duration: float = 20.0
+    duration: float = 15.0
     dt: float = 0.10
     initial_eta: np.ndarray = field(default_factory=lambda: np.zeros(6))
     initial_nu: np.ndarray = field(default_factory=lambda: np.zeros(6))
@@ -101,6 +171,8 @@ class ObjectiveConfig:
     target_tolerance: float = 0.10
     target_position_weight: float = 1.0
     target_attitude_weight: float = 1.0
+    require_station_keeping: bool = False
+    station_keeping_window: float = 2.0
 
     @property
     def target_pose(self) -> np.ndarray:
@@ -127,13 +199,20 @@ class CostWeights:
     attitude: float = 5.0
     energy: float = 0.1
     smoothness: float = 0.1
+    station_position: float = 5.0
+    station_attitude: float = 2.0
+    station_linear_velocity: float = 10.0
+    station_angular_velocity: float = 5.0
+    allocation_quality: float = 50.0
+    inward_direction: float = 100.0
+    position_spacing: float = 10.0
 
 @dataclass(frozen=True)
 class OptimizerConfig:
     """Numerical settings for the optimizer."""
 
-    max_iterations: int =   15
-    population_size: int =   5
+    max_iterations: int =   20
+    population_size: int =   8
     random_seed: int = 1
 
 

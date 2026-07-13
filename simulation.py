@@ -51,7 +51,7 @@ def simulate(
     """Simulate the vehicle response for one design and command history."""
 
     time = simulation_time_grid(cfg)
-    allocation_matrix = build_allocation_matrix(design.alpha, vehicle)
+    allocation_matrix = build_allocation_matrix(design, vehicle)
     state = initial_state(cfg)
     control_state = initial_control_runtime_state(cfg)
 

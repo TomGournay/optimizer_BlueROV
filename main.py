@@ -4,7 +4,14 @@ from pathlib import Path
 
 import numpy as np
 
-from allocation import thruster_directions
+from allocation import (
+    allocate_thruster_forces_optimized,
+    allocation_singular_values,
+    build_allocation_matrix,
+    direction_outward_alignment,
+    thruster_directions,
+    thruster_positions,
+)
 from config import ProblemConfig
 from controls import control_parameter_names, default_control_params
 from cost import (
@@ -18,6 +25,7 @@ from models import ControlParams, Design
 from optimization import run_optimization
 from plots import save_optimization_plots, save_simulation_plots
 from simulation import simulate
+from thrusters import inverse_thrust_law, thrust_law
 from vehicle import default_vehicle_model
 
 
@@ -25,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     """Parse command-line arguments."""
 
     parser = argparse.ArgumentParser(
-        description="Run BlueROV2 design-control simulation or optimization."
+        description="Run 6-thruster vectorized design-control simulation or optimization."
     )
     parser.add_argument(
         "mode",
@@ -88,16 +96,21 @@ def parse_args() -> argparse.Namespace:
         help="Time at which the target pose should be imposed. Defaults to final time.",
     )
     parser.add_argument(
-        "--alpha-deg",
+        "--station-keeping",
+        action="store_true",
+        help="Penalize motion and target error over a holding window near arrival.",
+    )
+    parser.add_argument(
+        "--station-window",
         type=float,
-        default=45.0,
-        help="Alpha value used for simulate mode.",
+        default=None,
+        help="Station-keeping window duration in seconds.",
     )
     parser.add_argument(
         "--command",
         type=float,
         default=0.5,
-        help="Horizontal command magnitude used for simulate mode.",
+        help="Forward desired wrench fraction used for simulate mode.",
     )
     parser.add_argument(
         "--duration",
@@ -160,6 +173,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--target-pose cannot be combined with partial target arguments")
     if args.target_attitude is not None and args.target_attitude_deg is not None:
         parser.error("use only one of --target-attitude and --target-attitude-deg")
+    if args.station_window is not None and args.station_window <= 0.0:
+        parser.error("--station-window must be positive")
 
     return args
 
@@ -214,6 +229,17 @@ def config_from_args(args: argparse.Namespace) -> ProblemConfig:
             objective=replace(cfg.objective, **objective_updates),
         )
 
+    station_updates = {}
+    if args.station_keeping:
+        station_updates["require_station_keeping"] = True
+    if args.station_window is not None:
+        station_updates["station_keeping_window"] = args.station_window
+    if station_updates:
+        cfg = replace(
+            cfg,
+            objective=replace(cfg.objective, **station_updates),
+        )
+
     if args.duration is not None:
         cfg = replace(
             cfg,
@@ -251,18 +277,13 @@ def config_from_args(args: argparse.Namespace) -> ProblemConfig:
     return cfg
 
 
-def design_from_alpha(cfg: ProblemConfig, alpha_rad: float) -> Design:
-    """Build a Design for simulate mode using alpha and midpoint defaults."""
+def design_from_defaults(cfg: ProblemConfig) -> Design:
+    """Build a deterministic vectorized thruster design for simulate mode."""
 
-    if "alpha" not in cfg.design.names:
-        raise ValueError("the current allocation model requires a design variable named 'alpha'")
-
-    lower_bounds = np.asarray(cfg.design.lower_bounds, dtype=float)
-    upper_bounds = np.asarray(cfg.design.upper_bounds, dtype=float)
-    values = 0.5 * (lower_bounds + upper_bounds)
-    values[cfg.design.names.index("alpha")] = alpha_rad
-
-    return Design(names=cfg.design.names, values=tuple(values.tolist()))
+    return Design(
+        names=cfg.design.names,
+        values=tuple(cfg.design.defaults.tolist()),
+    )
 
 
 def forward_demo_control_params(
@@ -271,17 +292,26 @@ def forward_demo_control_params(
     design: Design,
     command_magnitude: float,
 ) -> ControlParams:
-    """Build a simple open-loop command that pushes horizontal thrusters forward."""
+    """Build a simple open-loop command that requests forward body force."""
 
     if cfg.control.mode != "piecewise_constant":
         return default_control_params(cfg, vehicle)
 
-    commands = np.zeros((cfg.control.n_segments, vehicle.geometry.n_thrusters), dtype=float)
-    directions = thruster_directions(design.alpha, vehicle)
+    allocation_matrix = build_allocation_matrix(design, vehicle)
+    thrust_limits = thrust_law(np.array([cfg.control.u_min, cfg.control.u_max]))
+    force_min = float(np.min(thrust_limits))
+    force_max = float(np.max(thrust_limits))
 
-    for motor_id in vehicle.geometry.horizontal_thruster_ids:
-        forward_sign = np.sign(directions[motor_id, 0])
-        commands[:, motor_id] = command_magnitude * forward_sign
+    tau_desired = np.zeros(6, dtype=float)
+    tau_desired[0] = command_magnitude * force_max
+    desired_thrusts = allocate_thruster_forces_optimized(
+        allocation_matrix=allocation_matrix,
+        tau_desired=tau_desired,
+        force_min=force_min,
+        force_max=force_max,
+    )
+    command = inverse_thrust_law(desired_thrusts)
+    commands = np.tile(command, (cfg.control.n_segments, 1))
 
     return ControlParams(
         mode=cfg.control.mode,
@@ -290,20 +320,42 @@ def forward_demo_control_params(
     )
 
 
+def print_design_summary(design: Design, vehicle) -> None:
+    """Print normalized thruster positions, directions, and allocation quality."""
+
+    positions = thruster_positions(design, vehicle)
+    directions = thruster_directions(design, vehicle)
+    alignment = direction_outward_alignment(design, vehicle)
+    singular_values = allocation_singular_values(design, vehicle)
+
+    print(f"Design variables: {len(design.values)} raw vector components")
+    print("Thruster layout [body frame, same axes as NED at zero attitude]:")
+    for motor_id, (position, direction, dot_value) in enumerate(
+        zip(positions, directions, alignment)
+    ):
+        position_text = np.array2string(position, precision=4, suppress_small=True)
+        direction_text = np.array2string(direction, precision=4, suppress_small=True)
+        print(
+            f"  M{motor_id}: pos={position_text}, "
+            f"dir={direction_text}, outward_dot={dot_value:.4f}"
+        )
+    print("Allocation singular values:")
+    print("  " + np.array2string(singular_values, precision=4, suppress_small=True))
+
+
 def print_simulation_summary(
     simulation,
     cfg: ProblemConfig,
     design: Design,
+    vehicle,
     cost: float,
 ) -> None:
     """Print key simulation diagnostics."""
 
     final_eta = simulation.eta[-1]
-    components = cost_components(simulation, cfg)
+    components = cost_components(simulation, cfg, design, vehicle)
 
-    print("Design variables:")
-    for name, value in design.as_dict().items():
-        print(f"  {name}: {value:.6f} rad ({np.rad2deg(value):.3f} deg)")
+    print_design_summary(design, vehicle)
 
     print("Final eta [north, east, down, roll, pitch, yaw]:")
     print("  " + np.array2string(final_eta, precision=4, suppress_small=True))
@@ -324,6 +376,11 @@ def print_simulation_summary(
             )
         )
         print("Drift and attitude trajectory penalties are disabled for this objective.")
+        if cfg.objective.require_station_keeping:
+            print(
+                "Station keeping enabled over "
+                f"{cfg.objective.station_keeping_window:.3f} s."
+            )
 
     print("Cost components:")
     for name, value in components.items():
@@ -336,7 +393,7 @@ def run_simulation_mode(cfg: ProblemConfig, args: argparse.Namespace) -> None:
     """Run one deterministic demonstration simulation."""
 
     vehicle = default_vehicle_model()
-    design = design_from_alpha(cfg, np.deg2rad(args.alpha_deg))
+    design = design_from_defaults(cfg)
     control_params = forward_demo_control_params(
         cfg=cfg,
         vehicle=vehicle,
@@ -345,15 +402,15 @@ def run_simulation_mode(cfg: ProblemConfig, args: argparse.Namespace) -> None:
     )
 
     simulation = simulate(design, control_params, cfg, vehicle)
-    cost = trajectory_cost(simulation, cfg)
+    cost = trajectory_cost(simulation, cfg, design, vehicle)
 
     print("Mode: simulate")
     print(f"Objective mode: {cfg.objective.mode}")
     print(f"Control mode: {cfg.control.mode}")
-    print_simulation_summary(simulation, cfg, design, cost)
+    print_simulation_summary(simulation, cfg, design, vehicle, cost)
 
     if not args.no_plots:
-        save_simulation_plots(simulation, Path(args.output_dir))
+        save_simulation_plots(simulation, Path(args.output_dir), design, vehicle)
         print(f"Plots saved in: {Path(args.output_dir).resolve()}")
 
 
@@ -366,10 +423,10 @@ def run_optimization_mode(cfg: ProblemConfig, args: argparse.Namespace) -> None:
     print("Mode: optimize")
     print(f"Objective mode: {cfg.objective.mode}")
     print(f"Control mode: {cfg.control.mode}")
-    print_simulation_summary(result.simulation, cfg, result.design, result.cost)
+    print_simulation_summary(result.simulation, cfg, result.design, vehicle, result.cost)
 
     if not args.no_plots:
-        save_optimization_plots(result, Path(args.output_dir))
+        save_optimization_plots(result, vehicle, Path(args.output_dir))
         print(f"Plots saved in: {Path(args.output_dir).resolve()}")
 
 

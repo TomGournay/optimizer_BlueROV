@@ -1,59 +1,88 @@
 import numpy as np
 from scipy.optimize import minimize
 
-from models import VehicleModel
+from models import Design, VehicleModel
 
 
-HORIZONTAL_FORWARD_SIGNS = np.array([ 1.0,  1.0, -1.0, -1.0])
-HORIZONTAL_LATERAL_SIGNS = np.array([ 1.0, -1.0, -1.0,  1.0])
+DESIGN_VECTOR_AXES = ("x", "y", "z")
+MIN_VECTOR_NORM = 1e-9
 
 
-VERTICAL_SIGNS = np.array([-1.0,  1.0,  1.0, -1.0])
+def design_vector(design: Design, prefix: str, motor_id: int) -> np.ndarray:
+    """Return one raw 3D vector from design variables."""
 
-def horizontal_thruster_directions(alpha: float) -> np.ndarray:
-    """Return unit directions for the four horizontal thrusters.
-
-    The directions follow the horizontal thruster order defined in geometry.py:
-    front-left, front-right, rear-left, rear-right.
-    """
-
-    directions = np.zeros((4, 3), dtype=float)
-    directions[:, 0] = HORIZONTAL_FORWARD_SIGNS * np.cos(alpha)
-    directions[:, 1] = HORIZONTAL_LATERAL_SIGNS * np.sin(alpha)
-    return directions
-
-
-def vertical_thruster_directions() -> np.ndarray:
-    """Return unit directions for the four vertical thrusters.
-
-    In the body convention used here, z points downward. A positive vertical
-    motor thrust therefore produces a positive Z force.
-    """
-
-    directions = np.zeros((4, 3), dtype=float)
-    directions[:, 2] = VERTICAL_SIGNS * 1.0
-    return directions
-
-
-def thruster_directions(alpha: float, vehicle: VehicleModel) -> np.ndarray:
-    """Return one unit direction vector per thruster."""
-
-    directions = np.zeros_like(vehicle.geometry.thruster_positions, dtype=float)
-    directions[list(vehicle.geometry.horizontal_thruster_ids)] = horizontal_thruster_directions(
-        alpha
+    return np.array(
+        [design.get(f"{prefix}_{axis}_m{motor_id}") for axis in DESIGN_VECTOR_AXES],
+        dtype=float,
     )
-    directions[list(vehicle.geometry.vertical_thruster_ids)] = vertical_thruster_directions()
-    return directions
 
 
-def moment_arms_from_center_of_mass(vehicle: VehicleModel) -> np.ndarray:
+def normalize_vectors(vectors: np.ndarray, label: str) -> np.ndarray:
+    """Return row-wise unit vectors, rejecting near-zero rows."""
+
+    vectors = np.asarray(vectors, dtype=float)
+    if vectors.ndim != 2 or vectors.shape[1] != 3:
+        raise ValueError(f"{label} must have shape (n, 3)")
+    if not np.all(np.isfinite(vectors)):
+        raise ValueError(f"{label} must be finite")
+
+    norms = np.linalg.norm(vectors, axis=1)
+    if np.any(norms < MIN_VECTOR_NORM):
+        raise ValueError(f"{label} contains a near-zero vector")
+
+    return vectors / norms[:, None]
+
+
+def thruster_position_unit_vectors(design: Design, vehicle: VehicleModel) -> np.ndarray:
+    """Return one unit sphere location vector per thruster."""
+
+    raw_positions = np.vstack(
+        [
+            design_vector(design, "pos", motor_id)
+            for motor_id in range(vehicle.geometry.n_thrusters)
+        ]
+    )
+    return normalize_vectors(raw_positions, "thruster position vectors")
+
+
+def thruster_positions(design: Design, vehicle: VehicleModel) -> np.ndarray:
+    """Return thruster positions projected onto the vehicle bounding sphere."""
+
+    radius = float(vehicle.geometry.thruster_sphere_radius)
+    if radius <= 0.0:
+        raise ValueError("thruster_sphere_radius must be positive")
+
+    return radius * thruster_position_unit_vectors(design, vehicle)
+
+
+def thruster_directions(design: Design, vehicle: VehicleModel) -> np.ndarray:
+    """Return one optimized unit direction vector per thruster."""
+
+    raw_directions = np.vstack(
+        [
+            design_vector(design, "dir", motor_id)
+            for motor_id in range(vehicle.geometry.n_thrusters)
+        ]
+    )
+    return normalize_vectors(raw_directions, "thruster direction vectors")
+
+
+def direction_outward_alignment(design: Design, vehicle: VehicleModel) -> np.ndarray:
+    """Return dot(direction, outward sphere normal) for each thruster."""
+
+    outward_normals = thruster_position_unit_vectors(design, vehicle)
+    directions = thruster_directions(design, vehicle)
+    return np.sum(outward_normals * directions, axis=1)
+
+
+def moment_arms_from_center_of_mass(design: Design, vehicle: VehicleModel) -> np.ndarray:
     """Return r_i vectors from the center of mass to each thruster."""
 
-    return vehicle.geometry.thruster_positions - vehicle.dynamics.center_of_mass
+    return thruster_positions(design, vehicle) - vehicle.dynamics.center_of_mass
 
 
-def build_allocation_matrix(alpha: float, vehicle: VehicleModel) -> np.ndarray:
-    """Build the 6 x n thruster allocation matrix T(alpha).
+def build_allocation_matrix(design: Design, vehicle: VehicleModel) -> np.ndarray:
+    """Build the 6 x n thruster allocation matrix T(design).
 
     Geometry, thrust directions, and the resulting wrench are expressed in the
     body frame. Each column maps one scalar thruster force into a body-frame
@@ -64,10 +93,64 @@ def build_allocation_matrix(alpha: float, vehicle: VehicleModel) -> np.ndarray:
     The wrench order is [X, Y, Z, K, M, N].
     """
 
-    directions = thruster_directions(alpha, vehicle)
-    moment_arms = moment_arms_from_center_of_mass(vehicle)
+    directions = thruster_directions(design, vehicle)
+    moment_arms = moment_arms_from_center_of_mass(design, vehicle)
     moments = np.cross(moment_arms, directions)
     return np.vstack((directions.T, moments.T))
+
+
+def allocation_singular_values(design: Design, vehicle: VehicleModel) -> np.ndarray:
+    """Return singular values of the design allocation matrix."""
+
+    return np.linalg.svd(build_allocation_matrix(design, vehicle), compute_uv=False)
+
+
+def allocation_quality_penalty(
+    design: Design,
+    vehicle: VehicleModel,
+    min_singular_value: float,
+) -> float:
+    """Penalize allocation matrices with weak 6-DOF authority."""
+
+    if min_singular_value <= 0.0:
+        return 0.0
+
+    singular_values = allocation_singular_values(design, vehicle)
+    shortfall = max(0.0, min_singular_value - float(singular_values[-1]))
+    return float((shortfall / min_singular_value) ** 2)
+
+
+def inward_direction_penalty(
+    design: Design,
+    vehicle: VehicleModel,
+    min_outward_dot: float,
+) -> float:
+    """Penalize directions that point too far toward the vehicle interior."""
+
+    alignment = direction_outward_alignment(design, vehicle)
+    shortfall = np.maximum(0.0, min_outward_dot - alignment)
+    return float(shortfall @ shortfall)
+
+
+def position_spacing_penalty(
+    design: Design,
+    vehicle: VehicleModel,
+    min_spacing: float,
+) -> float:
+    """Penalize optimized thruster positions that collapse together."""
+
+    if min_spacing <= 0.0:
+        return 0.0
+
+    positions = thruster_positions(design, vehicle)
+    penalty = 0.0
+    for i in range(positions.shape[0]):
+        for j in range(i + 1, positions.shape[0]):
+            distance = float(np.linalg.norm(positions[i] - positions[j]))
+            shortfall = max(0.0, min_spacing - distance)
+            penalty += (shortfall / min_spacing) ** 2
+
+    return float(penalty)
 
 
 def default_axis_weights(allocation_matrix: np.ndarray, epsilon: float = 1e-9) -> np.ndarray:

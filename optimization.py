@@ -70,10 +70,11 @@ def objective(
     """Return the scalar optimization objective for one candidate z."""
 
     try:
-        design, control_params = decode_z(z, cfg, vehicle)
-        simulation = simulate(design, control_params, cfg, vehicle)
-        cost = trajectory_cost(simulation, cfg)
-    except (FloatingPointError, ValueError, np.linalg.LinAlgError):
+        with np.errstate(over="raise", divide="raise", invalid="raise"):
+            design, control_params = decode_z(z, cfg, vehicle)
+            simulation = simulate(design, control_params, cfg, vehicle)
+            cost = trajectory_cost(simulation, cfg, design, vehicle)
+    except (FloatingPointError, RuntimeError, ValueError, np.linalg.LinAlgError):
         return float("inf")
 
     if not np.isfinite(cost):
@@ -97,6 +98,13 @@ def run_optimization(
         seed=cfg.optimizer.random_seed,
         polish=False,
     )
+
+    if not np.isfinite(result.fun):
+        raise RuntimeError(
+            "optimization did not find a feasible candidate. "
+            "Try lowering PID gain bounds, increasing design penalty weights, "
+            "or relaxing the target/time settings."
+        )
 
     design, control_params = decode_z(result.x, cfg, vehicle)
     simulation = simulate(design, control_params, cfg, vehicle)

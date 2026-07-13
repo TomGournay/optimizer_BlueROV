@@ -16,9 +16,9 @@ import numpy as np
 class Design:
     """Design variables for one simulation or optimization candidate.
 
-    Values are stored generically so new design variables can be added by
-    extending the design configuration. The alpha property is kept because the
-    current allocation model still uses alpha explicitly.
+    Values are stored generically so design variables can be added by extending
+    the design configuration. The vectorized thruster layout uses raw 3D
+    components that are normalized by allocation.py before entering physics.
     """
 
     names: tuple[str, ...]
@@ -38,10 +38,6 @@ class Design:
         except ValueError as exc:
             raise KeyError(f"unknown design variable: {name}") from exc
         return self.values[index]
-
-    @property
-    def alpha(self) -> float:
-        return self.get("alpha")
 
     def as_dict(self) -> dict[str, float]:
         return dict(zip(self.names, self.values))
@@ -82,8 +78,7 @@ class VehicleGeometry:
     """Fixed intrinsic geometry of the vehicle."""
 
     thruster_positions: np.ndarray
-    horizontal_thruster_ids: tuple[int, ...]
-    vertical_thruster_ids: tuple[int, ...]
+    thruster_sphere_radius: float
 
     @property
     def n_thrusters(self) -> int:

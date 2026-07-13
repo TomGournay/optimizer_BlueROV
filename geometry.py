@@ -10,66 +10,40 @@ from models import VehicleGeometry
 # when roll = pitch = yaw = 0, body x aligns with north, body y aligns with
 # east, and body z aligns with down.
 #
-# Thruster order used by this project:
-# 0: horizontal front-left
-# 1: horizontal front-right
-# 2: horizontal rear-left
-# 3: horizontal rear-right
-# 4: vertical front-left
-# 5: vertical front-right
-# 6: vertical rear-left
-# 7: vertical rear-right
+# The vectorized frame uses six thrusters. Their default locations are the
+# vertices of an octahedron on the vehicle bounding sphere; optimization can
+# move them on that sphere through the position design variables.
 
 
-THRUSTER_NAMES = (
-    "horizontal_front_left",
-    "horizontal_front_right",
-    "horizontal_rear_left",
-    "horizontal_rear_right",
-    "vertical_front_left",
-    "vertical_front_right",
-    "vertical_rear_left",
-    "vertical_rear_right",
-)
+N_THRUSTERS = 6
+THRUSTER_SPHERE_RADIUS = 0.25
 
-
-HORIZONTAL_THRUSTER_IDS = (0, 1, 2, 3)
-VERTICAL_THRUSTER_IDS = (4, 5, 6, 7)
+THRUSTER_NAMES = tuple(f"thruster_{motor_id}" for motor_id in range(N_THRUSTERS))
 
 
 def default_vehicle_geometry() -> VehicleGeometry:
-    """Return the fixed intrinsic geometry for the first BlueROV2 model.
+    """Return the fixed intrinsic geometry for the six-thruster frame.
 
-    The dimensions are deliberately simple starting values. They define where
-    forces are applied, not the thruster orientations or dynamic reference
-    points. Orientations that depend on the design variable alpha are computed
-    in allocation.py.
+    The stored positions are only a deterministic default layout and define the
+    number of thrusters plus the sphere radius. During optimization, allocation.py
+    rebuilds the actual positions from the design variables and projects them
+    onto the same sphere.
     """
 
-    x_h = 0.20
-    y_h = 0.16
-    z_h = 0.00
-
-    x_v = 0.16
-    y_v = 0.13
-    z_v = 0.00
-
-    thruster_positions = np.array(
+    unit_positions = np.array(
         [
-            [x_h, -y_h, z_h],
-            [x_h, y_h, z_h],
-            [-x_h, -y_h, z_h],
-            [-x_h, y_h, z_h],
-            [x_v, -y_v, z_v],
-            [x_v, y_v, z_v],
-            [-x_v, -y_v, z_v],
-            [-x_v, y_v, z_v],
+            [1.0, 0.0, 0.0],
+            [-1.0, 0.0, 0.0],
+            [0.0, 1.0, 0.0],
+            [0.0, -1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [0.0, 0.0, -1.0],
         ],
         dtype=float,
     )
+    thruster_positions = THRUSTER_SPHERE_RADIUS * unit_positions
 
     return VehicleGeometry(
         thruster_positions=thruster_positions,
-        horizontal_thruster_ids=HORIZONTAL_THRUSTER_IDS,
-        vertical_thruster_ids=VERTICAL_THRUSTER_IDS,
+        thruster_sphere_radius=THRUSTER_SPHERE_RADIUS,
     )
