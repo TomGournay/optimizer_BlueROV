@@ -264,6 +264,144 @@ def station_keeping_cost_components(
     }
 
 
+def station_tracking_norms(
+    simulation: SimulationResult,
+    cfg: ProblemConfig,
+) -> dict[str, np.ndarray]:
+    """Return target-error and velocity norms used for stability detection."""
+
+    target_position = np.asarray(cfg.objective.target_position, dtype=float)
+    target_attitude = np.asarray(cfg.objective.target_attitude, dtype=float)
+    if target_position.shape != (3,):
+        raise ValueError("target_position must have shape (3,)")
+    if target_attitude.shape != (3,):
+        raise ValueError("target_attitude must have shape (3,)")
+
+    position_error = simulation.eta[:, :3] - target_position
+    attitude_error = wrap_angle_error(simulation.eta[:, 3:6] - target_attitude)
+
+    return {
+        "position": np.linalg.norm(position_error, axis=1),
+        "attitude": np.linalg.norm(attitude_error, axis=1),
+        "linear_velocity": np.linalg.norm(simulation.nu[:, :3], axis=1),
+        "angular_velocity": np.linalg.norm(simulation.nu[:, 3:6], axis=1),
+    }
+
+
+def station_time_thresholds(cfg: ProblemConfig) -> dict[str, float]:
+    """Return positive thresholds used to declare stable station keeping."""
+
+    thresholds = {
+        "position": float(cfg.objective.station_position_tolerance),
+        "attitude": float(cfg.objective.station_attitude_tolerance),
+        "linear_velocity": float(cfg.objective.station_linear_velocity_tolerance),
+        "angular_velocity": float(cfg.objective.station_angular_velocity_tolerance),
+    }
+
+    if any(value <= 0.0 for value in thresholds.values()):
+        raise ValueError("station time tolerances must be positive")
+
+    return thresholds
+
+
+def station_window_indices_from_start(
+    time: np.ndarray,
+    start_index: int,
+    window: float,
+) -> np.ndarray:
+    """Return indices inside [time[start_index], time[start_index] + window]."""
+
+    start_time = float(time[start_index])
+    end_time = start_time + window
+    return np.flatnonzero((time >= start_time) & (time <= end_time))
+
+
+def station_window_violation(
+    norms: dict[str, np.ndarray],
+    thresholds: dict[str, float],
+    sample_indices: np.ndarray,
+) -> float:
+    """Return squared normalized violation for one station-keeping window."""
+
+    violation = 0.0
+    for name, threshold in thresholds.items():
+        maximum = float(np.max(norms[name][sample_indices]))
+        excess = max(0.0, maximum / threshold - 1.0)
+        violation += excess**2
+
+    return float(violation)
+
+
+def station_success_time_details(
+    simulation: SimulationResult,
+    cfg: ProblemConfig,
+) -> dict[str, float]:
+    """Return first successful stabilization time and failure diagnostics."""
+
+    if cfg.objective.mode not in TARGET_POSE_OBJECTIVE_MODES:
+        return {
+            "station_success": 0.0,
+            "station_success_time": 0.0,
+            "station_best_window_time": 0.0,
+            "station_failure": 0.0,
+        }
+    if not cfg.objective.station_time_objective:
+        return {
+            "station_success": 0.0,
+            "station_success_time": 0.0,
+            "station_best_window_time": 0.0,
+            "station_failure": 0.0,
+        }
+
+    window = float(cfg.objective.station_keeping_window)
+    if window <= 0.0:
+        raise ValueError("station_keeping_window must be positive")
+
+    time = np.asarray(simulation.time, dtype=float)
+    duration = float(time[-1])
+    norms = station_tracking_norms(simulation, cfg)
+    thresholds = station_time_thresholds(cfg)
+
+    best_violation = float("inf")
+    best_time = duration
+    latest_start = duration - window
+
+    for start_index, start_time in enumerate(time):
+        if start_time > latest_start + 1e-12:
+            break
+
+        sample_indices = station_window_indices_from_start(time, start_index, window)
+        if sample_indices.size == 0:
+            continue
+
+        violation = station_window_violation(norms, thresholds, sample_indices)
+        if violation < best_violation:
+            best_violation = violation
+            best_time = float(start_time)
+
+        if violation <= 0.0:
+            return {
+                "station_success": 1.0,
+                "station_success_time": float(start_time),
+                "station_best_window_time": float(start_time),
+                "station_failure": 0.0,
+            }
+
+    if not np.isfinite(best_violation):
+        best_violation = station_window_violation(
+            norms,
+            thresholds,
+            np.arange(time.size, dtype=int),
+        )
+
+    return {
+        "station_success": 0.0,
+        "station_success_time": float(duration),
+        "station_best_window_time": float(best_time),
+        "station_failure": float(1.0 + best_violation),
+    }
+
+
 def objective_cost(simulation: SimulationResult, cfg: ProblemConfig) -> float:
     """Return the active mission objective selected in cfg.objective.mode."""
 
@@ -355,6 +493,7 @@ def cost_components(
     }
     layout_components = design_cost_components(design, vehicle, cfg)
     station_components = station_keeping_cost_components(simulation, cfg)
+    station_time_components = station_success_time_details(simulation, cfg)
 
     return {
         "objective": objective_cost(simulation, cfg),
@@ -367,6 +506,7 @@ def cost_components(
         "energy": energy_cost(simulation, cfg),
         "smoothness": smoothness_cost(simulation),
         **station_components,
+        **station_time_components,
         **layout_components,
     }
 
@@ -383,14 +523,17 @@ def trajectory_cost(
     weights = cfg.cost
     drift_weight = weights.drift
     attitude_weight = weights.attitude
+    target_arrival_time_weight = weights.target_arrival_time
 
     if cfg.objective.mode in TARGET_POSE_OBJECTIVE_MODES:
         drift_weight = 0.0
         attitude_weight = 0.0
+    if cfg.objective.station_time_objective:
+        target_arrival_time_weight = 0.0
 
     return float(
         weights.objective * components["objective"]
-        + weights.target_arrival_time * components["target_arrival_time"]
+        + target_arrival_time_weight * components["target_arrival_time"]
         + drift_weight * components["drift"]
         + attitude_weight * components["attitude"]
         + weights.energy * components["energy"]
@@ -399,6 +542,8 @@ def trajectory_cost(
         + weights.station_attitude * components["station_attitude"]
         + weights.station_linear_velocity * components["station_linear_velocity"]
         + weights.station_angular_velocity * components["station_angular_velocity"]
+        + weights.station_success_time * components["station_success_time"]
+        + weights.station_failure * components["station_failure"]
         + weights.allocation_quality * components["allocation_quality"]
         + weights.inward_direction * components["inward_direction"]
         + weights.position_spacing * components["position_spacing"]

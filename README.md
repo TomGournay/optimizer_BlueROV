@@ -56,6 +56,8 @@ J =
 + w_station_a  * station_attitude
 + w_station_v  * station_linear_velocity
 + w_station_w  * station_angular_velocity
++ w_success_t  * station_success_time
++ w_failure    * station_failure
 + w_alloc      * allocation_quality
 + w_inward     * inward_direction
 + w_spacing    * position_spacing
@@ -99,6 +101,13 @@ Station keeping can be enabled for `target_position` and `target_pose`
 objectives. It penalizes target error and velocity over a holding window near
 arrival, so the optimizer prefers solutions that arrive, slow down, and stay
 stable instead of only crossing the target once.
+
+The station-time objective goes one step further: the configured simulation
+duration becomes a maximum allowed horizon, and the cost rewards the first time
+at which the vehicle remains inside all station-keeping tolerances for the full
+station window. If no stable window is found before the horizon, the candidate
+gets `station_success = 0`, `station_success_time = simulation_duration`, and a
+positive `station_failure` penalty.
 
 ## Frames and state convention
 
@@ -223,6 +232,30 @@ For the default optimizer settings from `config.py`:
 python main.py optimize
 ```
 
+During optimization, every tested candidate is logged by default in:
+
+```text
+outputs/candidate_log.jsonl
+```
+
+Each line is one JSON record. Candidate records include:
+
+```text
+evaluation
+status
+cost
+components
+design
+control
+```
+
+Use a custom log path or disable logging with:
+
+```bash
+python main.py optimize --candidate-log outputs/my_run.jsonl
+python main.py optimize --no-candidate-log
+```
+
 The optimizer can be expensive because the current vector is:
 
 ```text
@@ -315,15 +348,41 @@ The window is chosen after first arrival when the target tolerance is reached.
 If the target is not reached, the final window is used. When `target_time` is
 set, the window starts at that target time when possible.
 
+To optimize the time needed to reach and hold the target, use:
+
+```bash
+python main.py optimize --objective target_position --target-position 5 0 0 --station-time-objective --station-window 2 --duration 20
+python main.py optimize --objective target_pose --target-pose-deg 5 0 0 0 0 30 --station-time-objective --station-window 2 --duration 20
+```
+
+In this mode, `--duration` is the maximum simulation horizon. A candidate that
+stabilizes for the full station window at 6 s is better than one that stabilizes
+at 12 s. A candidate that never stabilizes before the horizon receives a failure
+penalty.
+
+The success thresholds are configurable from the command line:
+
+```bash
+python main.py optimize --objective target_position --target-position 5 0 0 --station-time-objective --station-position-tolerance 0.2 --station-linear-velocity-tolerance 0.05
+python main.py optimize --objective target_pose --target-pose-deg 5 0 0 0 0 30 --station-time-objective --station-attitude-tolerance-deg 5 --station-angular-velocity-tolerance-deg 3
+```
+
 Tune it in `config.py` with:
 
 ```python
 ObjectiveConfig.require_station_keeping
 ObjectiveConfig.station_keeping_window
+ObjectiveConfig.station_time_objective
+ObjectiveConfig.station_position_tolerance
+ObjectiveConfig.station_attitude_tolerance
+ObjectiveConfig.station_linear_velocity_tolerance
+ObjectiveConfig.station_angular_velocity_tolerance
 CostWeights.station_position
 CostWeights.station_attitude
 CostWeights.station_linear_velocity
 CostWeights.station_angular_velocity
+CostWeights.station_success_time
+CostWeights.station_failure
 ```
 
 ### Add a new objective mode
@@ -489,6 +548,8 @@ motor_commands_stacked.png
 motor_commands_heatmap.png
 thruster_geometry_3d.png
 ```
+
+Optimizer candidate logs are saved in `outputs/candidate_log.jsonl` by default.
 
 ## Plot usage
 

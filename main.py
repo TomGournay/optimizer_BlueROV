@@ -107,6 +107,35 @@ def parse_args() -> argparse.Namespace:
         help="Station-keeping window duration in seconds.",
     )
     parser.add_argument(
+        "--station-time-objective",
+        action="store_true",
+        help="Minimize the first time at which station keeping succeeds.",
+    )
+    parser.add_argument(
+        "--station-position-tolerance",
+        type=float,
+        default=None,
+        help="Position tolerance used to declare station-keeping success.",
+    )
+    parser.add_argument(
+        "--station-attitude-tolerance-deg",
+        type=float,
+        default=None,
+        help="Attitude tolerance in degrees used to declare station-keeping success.",
+    )
+    parser.add_argument(
+        "--station-linear-velocity-tolerance",
+        type=float,
+        default=None,
+        help="Linear velocity tolerance used to declare station-keeping success.",
+    )
+    parser.add_argument(
+        "--station-angular-velocity-tolerance-deg",
+        type=float,
+        default=None,
+        help="Angular velocity tolerance in deg/s used to declare station-keeping success.",
+    )
+    parser.add_argument(
         "--command",
         type=float,
         default=0.5,
@@ -154,6 +183,16 @@ def parse_args() -> argparse.Namespace:
         help="Directory where plots are saved.",
     )
     parser.add_argument(
+        "--candidate-log",
+        default=None,
+        help="JSONL path for optimizer candidate logs. Defaults to output-dir/candidate_log.jsonl.",
+    )
+    parser.add_argument(
+        "--no-candidate-log",
+        action="store_true",
+        help="Disable optimizer candidate logging.",
+    )
+    parser.add_argument(
         "--no-plots",
         action="store_true",
         help="Do not save plots.",
@@ -175,6 +214,26 @@ def parse_args() -> argparse.Namespace:
         parser.error("use only one of --target-attitude and --target-attitude-deg")
     if args.station_window is not None and args.station_window <= 0.0:
         parser.error("--station-window must be positive")
+    if (
+        args.station_position_tolerance is not None
+        and args.station_position_tolerance <= 0.0
+    ):
+        parser.error("--station-position-tolerance must be positive")
+    if (
+        args.station_attitude_tolerance_deg is not None
+        and args.station_attitude_tolerance_deg <= 0.0
+    ):
+        parser.error("--station-attitude-tolerance-deg must be positive")
+    if (
+        args.station_linear_velocity_tolerance is not None
+        and args.station_linear_velocity_tolerance <= 0.0
+    ):
+        parser.error("--station-linear-velocity-tolerance must be positive")
+    if (
+        args.station_angular_velocity_tolerance_deg is not None
+        and args.station_angular_velocity_tolerance_deg <= 0.0
+    ):
+        parser.error("--station-angular-velocity-tolerance-deg must be positive")
 
     return args
 
@@ -230,10 +289,26 @@ def config_from_args(args: argparse.Namespace) -> ProblemConfig:
         )
 
     station_updates = {}
-    if args.station_keeping:
+    if args.station_keeping or args.station_time_objective:
         station_updates["require_station_keeping"] = True
+    if args.station_time_objective:
+        station_updates["station_time_objective"] = True
     if args.station_window is not None:
         station_updates["station_keeping_window"] = args.station_window
+    if args.station_position_tolerance is not None:
+        station_updates["station_position_tolerance"] = args.station_position_tolerance
+    if args.station_attitude_tolerance_deg is not None:
+        station_updates["station_attitude_tolerance"] = np.deg2rad(
+            args.station_attitude_tolerance_deg
+        )
+    if args.station_linear_velocity_tolerance is not None:
+        station_updates["station_linear_velocity_tolerance"] = (
+            args.station_linear_velocity_tolerance
+        )
+    if args.station_angular_velocity_tolerance_deg is not None:
+        station_updates["station_angular_velocity_tolerance"] = np.deg2rad(
+            args.station_angular_velocity_tolerance_deg
+        )
     if station_updates:
         cfg = replace(
             cfg,
@@ -381,6 +456,16 @@ def print_simulation_summary(
                 "Station keeping enabled over "
                 f"{cfg.objective.station_keeping_window:.3f} s."
             )
+        if cfg.objective.station_time_objective:
+            print("Station time objective enabled:")
+            print(
+                "  success tolerances: "
+                f"position <= {cfg.objective.station_position_tolerance:.4f} m, "
+                f"attitude <= {np.rad2deg(cfg.objective.station_attitude_tolerance):.3f} deg, "
+                f"linear velocity <= {cfg.objective.station_linear_velocity_tolerance:.4f} m/s, "
+                f"angular velocity <= "
+                f"{np.rad2deg(cfg.objective.station_angular_velocity_tolerance):.3f} deg/s"
+            )
 
     print("Cost components:")
     for name, value in components.items():
@@ -418,11 +503,20 @@ def run_optimization_mode(cfg: ProblemConfig, args: argparse.Namespace) -> None:
     """Run differential evolution optimization."""
 
     vehicle = default_vehicle_model()
-    result = run_optimization(cfg, vehicle)
+    candidate_log_path = None
+    if not args.no_candidate_log:
+        if args.candidate_log is not None:
+            candidate_log_path = Path(args.candidate_log)
+        else:
+            candidate_log_path = Path(args.output_dir) / "candidate_log.jsonl"
+
+    result = run_optimization(cfg, vehicle, candidate_log_path=candidate_log_path)
 
     print("Mode: optimize")
     print(f"Objective mode: {cfg.objective.mode}")
     print(f"Control mode: {cfg.control.mode}")
+    if candidate_log_path is not None:
+        print(f"Candidate log saved in: {candidate_log_path.resolve()}")
     print_simulation_summary(result.simulation, cfg, result.design, vehicle, result.cost)
 
     if not args.no_plots:

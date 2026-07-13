@@ -173,6 +173,11 @@ class ObjectiveConfig:
     target_attitude_weight: float = 1.0
     require_station_keeping: bool = False
     station_keeping_window: float = 2.0
+    station_time_objective: bool = False
+    station_position_tolerance: float = 0.15
+    station_attitude_tolerance: float = float(np.deg2rad(5.0))
+    station_linear_velocity_tolerance: float = 0.05
+    station_angular_velocity_tolerance: float = float(np.deg2rad(3.0))
 
     @property
     def target_pose(self) -> np.ndarray:
@@ -203,6 +208,8 @@ class CostWeights:
     station_attitude: float = 2.0
     station_linear_velocity: float = 10.0
     station_angular_velocity: float = 5.0
+    station_success_time: float = 1.0
+    station_failure: float = 10.0
     allocation_quality: float = 50.0
     inward_direction: float = 100.0
     position_spacing: float = 10.0
@@ -211,9 +218,9 @@ class CostWeights:
 class OptimizerConfig:
     """Numerical settings for the optimizer."""
 
-    max_iterations: int =   20
-    population_size: int =   8
-    random_seed: int = 1
+    max_iterations: int =   50
+    population_size: int =   10
+    random_seed: int = 2
 
 
 @dataclass(frozen=True)
