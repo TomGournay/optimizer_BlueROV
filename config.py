@@ -77,8 +77,8 @@ class SimulationConfig:
     [north, east, down].
     """
 
-    duration: float = 8.0
-    dt: float = 0.05
+    duration: float = 20.0
+    dt: float = 0.10
     initial_eta: np.ndarray = field(default_factory=lambda: np.zeros(6))
     initial_nu: np.ndarray = field(default_factory=lambda: np.zeros(6))
 
@@ -132,8 +132,8 @@ class CostWeights:
 class OptimizerConfig:
     """Numerical settings for the optimizer."""
 
-    max_iterations: int =   5
-    population_size: int =   2
+    max_iterations: int =   15
+    population_size: int =   5
     random_seed: int = 1
 
 
